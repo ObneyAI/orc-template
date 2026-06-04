@@ -51,7 +51,11 @@ export OPENROUTER_API_KEY=sk-or-...
 (def ctx (:orc.template.backend/context app))
 
 (ex/run! ctx "event sourcing")
-;; => {:status :success :outputs {:summary "..." ...} :duration-ms 1234}
+;; => {:status :success
+;;     :outputs {:topic      "event sourcing"
+;;               :key-points "- Stores every state change as an immutable event\n- Rebuilds current state by replaying events\n- Commonly paired with CQRS"
+;;               :summary    "Event sourcing records each change to application state as an immutable event, so the current state can be rebuilt by replaying the event history; it is commonly paired with CQRS to separate writes from reads."}
+;;     :duration-ms 1873}
 
 (backend/stop app)
 ```
@@ -95,35 +99,71 @@ reads the matching `*_API_KEY` env var).
 
 Then set the base provider in the context (`backend.clj`):
 ```clojure
-:dscloj-provider :openrouter   ;; or :openai / :anthropic / :gemini / ...
+:dscloj-provider :openrouter   ;; or :openai / :anthropic / :gemini / :mistral / :ollama
 ```
 
 ### Many models, many providers — how easy it is
 
-- **Different model per node** — just set `:model` on the node. orc auto-registers
-  a `:<provider>/<model>` config by cloning the base provider's config, so **no
-  extra setup** is needed:
-  ```clojure
-  (orc/llm "draft"  :model "google/gemini-3-flash-preview" ...)   ;; fast/cheap
-  (orc/llm "polish" :model "anthropic/claude-3.5-sonnet"   ...)   ;; stronger
-  ```
-  With **OpenRouter** as the base provider, one key + a model string reaches
-  OpenAI, Anthropic, Google, Mistral, etc. — mix freely across nodes.
-- **Multiple distinct provider backends** (e.g. direct OpenAI *and* direct
-  Anthropic with separate keys) — register several configs and select the base
-  per workflow via the context's `:dscloj-provider`. (Within one tree, the base
-  provider is fixed; per-node `:model` varies on top of it. OpenRouter sidesteps
-  this entirely.)
-- **repl-researcher: main LM + sub LM** — the researcher node's `:model` is the
-  **main** LM that designs/generates the tree (Phase 1). The behaviour-tree ticks
-  it emits (Phase 2) run on a **sub** model: set `:rlm {:sub-model "..."}` and orc
-  injects it into every emitted `llm` node that doesn't pin its own `:model`:
-  ```clojure
-  (orc/repl-researcher "research"
-    :model "anthropic/claude-3.5-sonnet"          ;; main: plans & writes code
-    :rlm {:sub-model "google/gemini-3-flash-preview"}  ;; sub: runs the cheap ticks
-    :instruction "..." :reads [:input] :writes [:result])
-  ```
+**Different model per node.** Set `:model` on the node; orc auto-registers a
+`:<provider>/<model>` config by cloning the base provider's config — no extra
+setup. With **OpenRouter** as the base, one key + a model string reaches OpenAI,
+Anthropic, Google, Mistral, etc., so you can mix vendors freely across nodes.
+
+This complete two-step workflow drafts with a fast Google model and polishes with
+an OpenAI model, both through the single OpenRouter key (verified end-to-end):
+
+```clojure
+(require '[orc.template.backend :as backend]
+         '[ai.obney.orc.orc-service.interface :as orc])
+
+(def app (backend/start))
+(def ctx (:orc.template.backend/context app))
+
+(def draft-polish
+  (orc/workflow "draft-polish"
+    (orc/blackboard
+      {:topic    [:string {:description "The subject to write about."}]
+       :draft    [:string {:description "A rough first-draft paragraph about the topic."}]
+       :polished [:string {:description "A polished, concise, engaging final paragraph."}]})
+    (orc/sequence "main"
+      (orc/llm "draft"
+        :model "google/gemini-3-flash-preview"            ; fast/cheap (Google, via OpenRouter)
+        :instruction "Write a rough one-paragraph draft explaining the topic."
+        :reads [:topic] :writes [:draft])
+      (orc/llm "polish"
+        :model "openai/gpt-4o-mini"                       ; different vendor, same OpenRouter key
+        :instruction "Rewrite the draft to be clearer, more concise, and more engaging."
+        :reads [:draft] :writes [:polished]))))
+
+(let [sheet-id (orc/build-workflow! ctx draft-polish)]
+  (orc/execute ctx sheet-id {:topic "behaviour trees for AI agents"} :timeout-ms 90000))
+;; => {:status :success
+;;     :outputs
+;;     {:topic "behaviour trees for AI agents"
+;;      :draft "Behaviour trees are a hierarchical model used in game development and robotics to control the decision-making processes of AI agents. Unlike finite state machines, which can become tangled and difficult to manage as complexity increases, behaviour trees organize tasks into a modular tree structure consisting of leaf nodes that represent actions or conditions and composite nodes that control the flow of execution. These composite nodes, such as selectors and sequences, allow the agent to switch between different tasks based on environmental feedback or internal priorities."
+;;      :polished "Behaviour trees are a powerful hierarchical model used in game development and robotics for AI decision-making. Unlike finite state machines, which can become unwieldy with complexity, behaviour trees present tasks in a modular tree structure. Leaf nodes represent actions or conditions, while composite nodes, such as selectors and sequences, manage the execution flow. As a result, developers can create complex, responsive behaviours that are scalable and easy to understand."}
+;;     :duration-ms 8473}
+```
+
+**Multiple distinct provider backends** (e.g. direct OpenAI *and* direct Anthropic
+with separate keys) — register several configs and pick the base per workflow via
+the context's `:dscloj-provider`. Within one tree the base provider is fixed and
+per-node `:model` varies on top of it; OpenRouter sidesteps needing more than one
+base.
+
+**repl-researcher: main LM + sub LM.** The researcher node's `:model` is the
+**main** LM that designs and generates the tree (Phase 1). The behaviour-tree
+ticks it emits (Phase 2) run on a **sub** model: set `:rlm {:sub-model ...}` and
+orc injects it into every emitted `llm` node that doesn't pin its own `:model`:
+
+```clojure
+(orc/repl-researcher "research"
+  :model "anthropic/claude-3.5-sonnet"               ; main: plans & writes the code/tree
+  :rlm {:sub-model "google/gemini-3-flash-preview"}  ; sub: runs the cheap per-tick LLM calls
+  :instruction "Investigate the question and produce a well-sourced one-paragraph answer."
+  :reads [:question]
+  :writes [:answer])
+```
 
 ---
 
@@ -145,32 +185,121 @@ Postgres for production (RLS, per-tenant advisory locks, Fressian serialization)
 
 ---
 
-## Packages (mix what you need)
+## deps.edn — pinned versions & packages
 
-grain and orc are git deps pinned to a SHA in `deps.edn`; each grain "project" is
-a `:deps/root` you add only if you want it. Pick à la carte.
+grain and orc are **git deps pinned to a SHA**. To update grain/orc later, bump
+these two SHAs (and refresh the snapshots in `docs/orc-reference/`):
 
-### grain
-| Package | Gives you |
-|---------|-----------|
-| **grain-core-v2** | CQRS/event-sourcing core: commands, queries, read models, todo-processors, periodic tasks, pub/sub, kv-store + LMDB, **in-memory event store** |
-| **grain-event-store-postgres-v3** | Postgres event-store backend (RLS, advisory locks, Fressian) |
-| **grain-event-store-sqlite-v3** | SQLite event-store backend (file or `:memory:`) |
-| **grain-datastar-v2** | Reactive server-rendered UI over SSE (not used in this backend-only template) |
-| **grain-control-plane** | Distributed coordination — coordinator election, tenant leases, routing |
-| **grain-code-agent-tools** | Exposes the live grain runtime/registries to AI coding agents over nREPL |
-| **grain-mulog-aws-cloudwatch-emf-publisher** | AWS CloudWatch metrics/dashboards |
+| | Pinned SHA |
+|---|---|
+| **grain** | `d34b4496d00d70a0ff5d8539b5d0b40ad73a4541` |
+| **orc**   | `83c315ad53449cb3e8ceba6a8b824291cf4378ae` |
 
-### orc
-`obneyai/orc` (`:deps/root "projects/orc"`) bundles the agent framework
-(`orc-service` — DSL, execution, versioning) and pulls in the **litellm** LLM
-layer transitively. Optional sibling components exist for GEPA (prompt
-optimization), evaluation (LLM-as-judge), ColBERT (retrieval), ontology, and MCP
-sheet building — see `docs/orc-reference/orc-README.md`.
+### Critical — a base orc app
 
-This template's `deps.edn` includes: `grain-core-v2`,
-`grain-event-store-postgres-v3`, `grain-code-agent-tools`, `orc`, plus
-`integrant` and `data.json`. Drop or swap any of them.
+```clojure
+{:deps {obneyai/grain-core-v2
+        {:git/url "https://github.com/ObneyAI/grain.git"
+         :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+         :deps/root "projects/grain-core-v2"}
+
+        obneyai/orc
+        {:git/url "https://github.com/ObneyAI/orc.git"
+         :git/sha "83c315ad53449cb3e8ceba6a8b824291cf4378ae"
+         :deps/root "projects/orc"}
+
+        integrant/integrant {:mvn/version "1.0.1"}}
+
+ ;; LMDB (grain's read-model cache) needs these JVM flags:
+ :aliases {:dev {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]}}}
+```
+
+`grain-core-v2` is the whole CQRS/event-sourcing core (commands, queries, read
+models, todo-processors, periodic tasks, pub/sub, kv-store + LMDB) **and includes
+an in-memory event store**. `obneyai/orc` is the agent framework. That alone is a
+working orc app.
+
+### Event store — choose one
+
+In-memory needs no extra dep (`{:type :in-memory}`). For a durable store, add one
+block and require its interface namespace (so the `:conn` type registers):
+
+```clojure
+;; SQLite — local, single-node, file-backed
+obneyai/grain-event-store-sqlite-v3
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-event-store-sqlite-v3"}
+
+;; Postgres — production (RLS, per-tenant advisory locks, Fressian)
+obneyai/grain-event-store-postgres-v3
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-event-store-postgres-v3"}
+```
+
+The matching `:conn` maps and requires are in
+[Pick your event store](#pick-your-event-store).
+
+### Optional grain packages (à la carte)
+
+```clojure
+;; Reactive server-rendered UI over SSE (Datastar)
+obneyai/grain-datastar-v2
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-datastar-v2"}
+
+;; Distributed coordination — coordinator election, tenant leases, routing
+obneyai/grain-control-plane
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-control-plane"}
+
+;; Exposes the live grain runtime/registries to AI coding agents over nREPL
+obneyai/grain-code-agent-tools
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-code-agent-tools"}
+
+;; AWS CloudWatch metrics & dashboards
+obneyai/grain-mulog-aws-cloudwatch-emf-publisher
+{:git/url "https://github.com/ObneyAI/grain.git"
+ :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
+```
+
+grain also publishes `grain-dspy-extensions` (and v2 event-store backends) — see
+the grain repo's `projects/` directory.
+
+### About the orc dep
+
+`obneyai/orc` is **one bundle** that already includes everything: the
+`orc-service` engine + DSL (with **repl-researcher** built in), plus GEPA (prompt
+optimization), evaluation (LLM-as-judge), ColBERT (retrieval), ontology, MCP
+sheet-builder, langfuse, and the litellm provider layer. There are no separate
+consumer deps for those — adding `obneyai/orc` gives you all of them.
+
+> **Slim orc (advanced).** ColBERT and ontology pull heavy ML deps (Python /
+> DJL + PyTorch). To drop them, depend on the engine component instead of the
+> umbrella project and supply `grain-core-v2` yourself:
+> ```clojure
+> obneyai/orc-service
+> {:git/url "https://github.com/ObneyAI/orc.git"
+>  :git/sha "83c315ad53449cb3e8ceba6a8b824291cf4378ae"
+>  :deps/root "components/orc-service"}
+> ```
+> This keeps the behaviour-tree engine, DSL, and repl-researcher. Component
+> coordinates can shift between commits — pin and review.
+
+### What this template ships with
+
+`grain-core-v2` + `grain-event-store-postgres-v3` + `grain-code-agent-tools` +
+`obneyai/orc`, plus `integrant` and `org.clojure/data.json`. Drop or swap any —
+e.g. remove the Postgres dep for in-memory, or drop `grain-code-agent-tools`
+(and its `code-agent-tools/install!` call in `backend.clj`) if you don't want the
+AI-agent runtime hooks.
 
 ---
 

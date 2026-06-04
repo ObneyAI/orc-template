@@ -37,8 +37,11 @@
       :reads [:input] :writes [:summary])))
 
 (let [sheet-id (orc/build-workflow! ctx wf)]
-  (orc/execute ctx sheet-id {:input "..."}))
-;; => {:status :success :outputs {:input "..." :summary "..."} :duration-ms n}
+  (orc/execute ctx sheet-id {:input "Grain is a CQRS/event-sourcing library; orc adds behaviour-tree agents on top."}))
+;; => {:status :success
+;;     :outputs {:input   "Grain is a CQRS/event-sourcing library; orc adds behaviour-tree agents on top."
+;;               :summary "Grain provides CQRS and event sourcing. orc builds on it to run behaviour-tree agents."}
+;;     :duration-ms 1200}
 ```
 
 `ctx` is our grain context — `(:orc.template.backend/context app)`.
@@ -111,11 +114,18 @@ key `:dscloj-provider`.
 - **Different model per node** — set `:model` on the node. orc auto-registers a
   `:<provider>/<model>` config by **cloning the base config**
   (`executor/get-provider-with-model`) — no extra registration. With OpenRouter
-  as the base, one key reaches every vendor via the model string:
+  as the base, one key reaches every vendor via the model string (this exact
+  draft→polish sequence is verified in the README — Google then OpenAI, one key):
   ```clojure
   (orc/sequence "main"
-    (orc/llm "draft"  :model "google/gemini-3-flash-preview" ...)   ; fast/cheap
-    (orc/llm "polish" :model "anthropic/claude-3.5-sonnet"   ...))  ; stronger
+    (orc/llm "draft"
+      :model "google/gemini-3-flash-preview"          ; fast/cheap (Google)
+      :instruction "Write a rough one-paragraph draft explaining the topic."
+      :reads [:topic] :writes [:draft])
+    (orc/llm "polish"
+      :model "openai/gpt-4o-mini"                      ; different vendor, same key
+      :instruction "Rewrite the draft to be clearer, more concise, and more engaging."
+      :reads [:draft] :writes [:polished]))
   ```
 - **Multiple distinct provider backends** (separate keys/endpoints) — register
   several configs; pick the base per workflow via `:dscloj-provider`. Within one
@@ -128,9 +138,11 @@ key `:dscloj-provider`.
   cheap one:
   ```clojure
   (orc/repl-researcher "research"
-    :model "anthropic/claude-3.5-sonnet"
-    :rlm {:sub-model "google/gemini-3-flash-preview"}
-    :instruction "..." :reads [:input] :writes [:result])
+    :model "anthropic/claude-3.5-sonnet"               ; main: plans & writes the code/tree
+    :rlm {:sub-model "google/gemini-3-flash-preview"}  ; sub: runs the cheap per-tick LLM calls
+    :instruction "Investigate the question and produce a well-sourced one-paragraph answer."
+    :reads [:question]
+    :writes [:answer])
   ```
 
 ## Things we've confirmed in this project
