@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: orc_template_postgres
+    environment:
+      POSTGRES_DB: orc_template
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    # Host 5433 to coexist with other local Postgres instances (e.g. grain-local
+    # already binds 5432). Container port stays 5432. Override with PG_PORT.
+    ports:
+      - "5433:5432"
+    volumes:
+      - orc_template_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orc_template"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  orc_template_pgdata: {}
