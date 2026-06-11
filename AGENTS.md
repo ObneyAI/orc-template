@@ -37,5 +37,5 @@ the `webserver` (Pedestal) component, compose their routes, and start the server
 in a new Integrant key.
 
 ## Pinned dependency SHAs (deps.edn)
-grain `d34b4496…`, orc `83c315ad…` — a known-good, mutually-compatible set (from
-the `ObneyAI/grain-todo-list` reference repo). Bump deliberately, together.
+grain `0ab49d7…`, orc `ebb9a48…` — update deliberately, together, against their
+remotes.

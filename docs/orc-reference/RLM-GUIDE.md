@@ -136,12 +136,14 @@ All options accepted by the `repl-researcher` node and the `:rlm` config map.
 | `:max-iterations` | int | 5 | Max Phase-1 iterations. If the model neither calls `(final! ...)` nor calls `(emit-tree! ...)` within this many iterations, the run returns `{:status :failure :error "Max iterations reached without final!"}`. |
 | `:timeout-ms` | int | 900000 (15 min) | Hard wall-clock budget for Phase 2. Precedence: node's `:timeout-ms` > parent tick's `:timeout-ms` > hardcoded 15-minute default. When Phase 2 budget is exhausted mid-flight the child tick is cancelled. |
 | `:rlm` | map or `true` | `false` | Enables RLM mode. `true` is equivalent to `{}`. See "`:rlm` config map" below. |
+| `:context` | map | `nil` | Ontology context injection. When set, the framework queries the ontology for patterns tied to the configured `:tree-id` and prepends a formatted summary to the model's instruction at run time. See [Ontology context injection](#ontology-context-injection-context) below. |
 
 ### `:rlm` config map options
 
 | Option | Type | Default | Purpose |
 |---|---|---|---|
 | `:recursive?` | bool | `false` | Non-terminal `emit-tree!` — after each Phase-2 tree completes, control returns to Phase 1 for inspection / follow-up / `(final! ...)`. See [Recursive mode](#recursive-mode-rlm-recursive-true). |
+| `:auto-classify?` | bool | `false` | Before Phase 1 starts, classify the task against the seed corpus and prepend the top-fitting pattern's body (capabilities + worked-example DSL snippets in `:strengths.:recommended-pattern` + observed weaknesses + representative-uses) to the model's instruction. Pairs naturally with `:recursive? true`. See [Pattern injection via R-Inject](#pattern-injection-via-r-inject-auto-classify) below. |
 | `:debug?` | bool | `false` | Verbose `[DEBUG RLM]` / `[DEBUG Tree]` stderr logging useful during development. Default off for production. |
 | `:available-code-nodes` | string | nil | Markdown catalog of pre-built `:code` fns the model can reference via `[:code {:fn "ns/sym"}]`. Surfaced as an extra DSCloj module input field. See [Pre-built code-node catalog](#pre-built-code-node-catalog-available-code-nodes). |
 | `:sub-model` | string | nil | Alternative location for `:sub-model` — `(:sub-model (:rlm node))` takes precedence over `(:sub-model node)`. Either works. |
@@ -211,6 +213,271 @@ Set on the `repl-researcher` node, or alternatively under the `:rlm` map as `:rl
 
 This matches the predict-rlm bench's "apples-to-apples" pattern (gpt-5.4 main + gpt-5.1-chat sub). See [`development/bench/predict-rlm-comparison/`](../development/bench/predict-rlm-comparison/) for runnable examples.
 
+## Pattern injection via R-Inject (`:auto-classify?`)
+
+`:auto-classify? true` on the `:rlm` config opts the node into automatic classification against the corpus of structural patterns (tree-classes) and behavioral patterns (behavioral subtrees). Before Phase 1 starts:
+
+1. The framework builds a task signature from the node's `:instruction` (and parent-tree context when composed).
+2. The signature is reranked against ColBERT-indexed pattern descriptions across both granularities.
+3. The top-fitting structural pattern's full body — capabilities + observed strengths with worked-example DSL snippets + observed weaknesses with recommended fixes + representative-uses + a prose summary — gets prepended to the model's instruction.
+4. The top-N behavioral candidates (default top-3) follow, with reranker reasoning, the same body shape, and a fresh-mint marker when none scored above the confidence floor.
+
+The model sees this block *before* it designs its tree, so its first `emit-tree!` response is informed by patterns that have shipped successfully on similar tasks. The prepend is **examples, not mandates** — the model can adopt, adapt, or design from scratch.
+
+### Config shape
+
+```clojure
+(orc/repl-researcher "researcher"
+  :model "google/gemini-3-flash-preview"
+  :instruction "Review the provided document and produce structured findings."
+  :reads  [:document]
+  :writes [:findings :recommendations]
+  :rlm {:auto-classify? true
+        :recursive? true})
+```
+
+That's the whole opt-in. No `:tree-id` to manage, no per-task UUIDs to coordinate, no pattern records to keep current — the corpus is shared across all consumers that have `:auto-classify? true` set and updates from observed evidence (see [`LIVING-DESCRIPTIONS.md`](LIVING-DESCRIPTIONS.md) for how bodies evolve).
+
+### What the model actually sees
+
+A real prepend from a scheduling task (truncated for readability):
+
+```
+## Suggested patterns from corpus
+
+These are concrete EXAMPLES retrieved from the seed corpus based on
+classification of your task. Each example includes:
+  - WHY the candidate fits (reranker reasoning)
+  - The pattern's prose summary (seed `:summary`)
+  - Capabilities it provides
+  - Proven STRENGTHS — traits observed to work, each with a worked-
+    example DSL snippet you can adapt
+  - Observed WEAKNESSES — failure modes others hit, with the
+    recommended fix
+  - Representative uses where this pattern has shipped
+
+Mimic what works, modify what's risky for your task, OR design from
+scratch. They are not mandates — your job is to design the RIGHT tree
+for THIS task, using the corpus as evidence not gospel.
+
+### Structural patterns (top 1 from corpus retrieval)
+#### Top match (confidence: 1.00)
+Why this fits: This candidate explicitly references 'shift assignment'
+and 'on-call rotation' as examples...
+
+Pattern guidance (seed `:summary`):
+Scheduling tasks fit a staged sequential pipeline: enumerate
+constraints → propose assignment → conflict-check with code → emit
+final + justification...
+
+Capabilities:
+  - :sequence of typically 3-4 stages...
+
+Strengths (proven traits — these patterns have been observed to work):
+  - **Trait:** explicit separate stages for constraint enumeration
+    vs proposal vs check makes the failure mode visible (confidence
+    1.00, evidence-count 1)
+    - Good when: the problem has both hard constraints AND soft
+      preferences
+    - Worked example DSL (corpus reference — adapt to your task):
+      ```clojure
+      [:sequence
+        [:llm {:reads [:team :availability :rules]
+               :writes [:hard-constraints :soft-prefs]}]
+        [:llm {:reads [:hard-constraints :soft-prefs :history]
+               :writes [:proposal]}]
+        [:code {:reads [:proposal :hard-constraints]
+                :writes [:conflicts]
+                :fn (fn [{:keys [proposal hard-constraints]}]
+                      {:conflicts []})}]
+        [:llm {:reads [:proposal :conflicts]
+               :writes [:final-schedule :justification]}]
+        [:final {:keys [:final-schedule :justification]}]]
+      ```
+...
+```
+
+The trace is written to `/tmp/r-inject-trace-<sheet-id>.edn` for every
+auto-classified run — see [Inspecting the classifier](#inspecting-the-classifier)
+in the trace tools section below.
+
+### When `:auto-classify?` pairs with `:recursive?`
+
+The two flags are independently useful but most powerful together:
+- `:auto-classify?` shapes the model's *first* design with corpus context.
+- `:recursive?` lets the model adapt across iterations as Phase-2 results arrive.
+
+When a Phase-2 leaf fails, `:tree-results` surfaces `:failed-leaves` with
+the node-id + error, and the model typically emits a focused single-node
+recovery tree rather than rebuilding the whole pipeline. The forward
+guidance from the prepend + the backward signal from drill-down + the
+"Common pitfalls" section in the prompt compose into a system that
+recovers from failures rather than getting stuck.
+
+See [`SELF-IMPROVING-LOOP.md`](SELF-IMPROVING-LOOP.md) for the
+end-to-end consumer walkthrough.
+
+### Behavioral mints — contributing new patterns to the corpus
+
+When `classify-behaviors` returns a fresh-mint marker (no candidate
+scored above the confidence floor for the task's accomplishment shape),
+the model can contribute a new behavior via the sandbox primitive
+`(mint-behavior! ...)`:
+
+```clojure
+(mint-behavior!
+  "iterate-on-simulated-feedback"
+  {:capabilities ["iterate parameter adjustments driven by measured feedback"
+                  "produce a converged parameter map + per-round metrics history"]
+   :strengths [{:trait "pair LLM-driven heuristic adjustments with a deterministic oracle for the feedback signal"
+                :good-when "the search space is continuous and the oracle is cheap to evaluate"
+                :recommended-pattern "[:sequence [:llm {:writes [:hypothesis]}] [:code {:fn run-oracle :writes [:metrics]}] [:llm {:writes [:adjusted-hypothesis]}] [:condition (fn [{:keys [metrics]}] (converged? metrics)) ...]]"
+                :confidence 0.7
+                :evidence-count 1}]
+   :weaknesses [{:trait "single-pass LLM can miss interactions between adjusted parameters"
+                 :avoid-when "the parameter space has known multiplicative interactions"
+                 :recommended-alternative "split tree into per-parameter validation loops with cross-checks"
+                 :confidence 0.6
+                 :evidence-count 1}]
+   :representative-uses ["game-balance playtest tuning"]
+   :summary "Iterate parameter adjustments driven by measured feedback until a target metric stabilizes. Pair the LLM's hypothesis generation with a trusted oracle (real measurement or deterministic check) so the feedback signal is grounded."
+   :version 1
+   :consolidated-from-event-count 0}
+  :parent nil)
+```
+
+The minted body must validate against the description-body Malli
+schema. The mint dispatches `:ontology/mint-behavioral-subtree` and
+returns the minted UUID as a string. The behavior is immediately
+queryable by future `classify-behaviors` calls — the QP-3 force-rebuild
+processor re-indexes ColBERT on the new content so the next task that
+matches the behavioral shape surfaces it at high confidence (typically
+1.00 for direct shape matches), even when the future task is in a
+different domain (e.g., game-balance → ML hyperparameter tuning).
+
+### Inspecting the classifier
+
+Every `:auto-classify?` run writes a sidecar trace to
+`/tmp/r-inject-trace-<sheet-id>.edn`:
+
+```clojure
+{:rendered-at "2026-06-09T..."
+ :prepend "## Suggested patterns from corpus..."     ; full text
+ :prepend-chars 4186
+ :original-instruction-chars 800
+ :classifier-payload
+ {:structural {:assigned-tree-id #uuid "..."
+               :confidence 1.00
+               :top-candidates [{:document-metadata {:target-id "..."}
+                                  :reasoning "<reranker reasoning>"
+                                  :fitness-score 1.00} ...]
+               :rerank-fallback? false}
+  :behavioral {:behaviors [{:behavior-id #uuid "..."
+                            :confidence 0.95
+                            :reasoning "<reranker reasoning>"} ...]
+               :rerank-fallback? false}}}
+```
+
+Read this to confirm which pattern was matched, what the reranker
+reasoned, and what the model actually saw. The `:rerank-fallback?` flag
+is the surfacing of reranker failure: when `true`, the classifier fell
+back to pure ColBERT-similarity scoring and the result should be
+treated with caution.
+
+---
+
+## Ontology context injection (`:context`) — manual / legacy mode
+
+`:auto-classify?` is the typical opt-in. The `:context` map below is
+the manual alternative for consumers who want explicit control over
+which patterns get retrieved (e.g., they're managing their own
+per-task-class UUIDs and have hand-curated pattern records via
+`:ontology/record-tree-strength` / `record-tree-weakness`).
+
+When set, the framework looks up patterns recorded under the configured `:tree-id` and prepends a formatted "Relevant Knowledge" section to the researcher's instruction at execute time — so the model sees previously-recorded successful patterns (and patterns to avoid) when it starts designing its tree.
+
+The same `:context` parameter exists on `orc/llm` leaf nodes; the wiring is symmetrical, the consuming pipeline is the same.
+
+### Config shape
+
+```clojure
+(orc/repl-researcher "researcher"
+  :model "google/gemini-2.5-flash"
+  :instruction "..."
+  :reads  [:document]
+  :writes [:summary :key-dates :entities]
+  :rlm    true
+  :context {:tree-id          <UUID — the key under which patterns are stored>
+            :self-learning?   true
+            :include-patterns true     ;; surface success patterns
+            :include-failures true     ;; surface failure patterns
+            :problem-type     "problem:Extraction"})   ;; optional problem-class URI
+```
+
+| Field | Type | Purpose |
+|---|---|---|
+| `:tree-id` | UUID | The retrieval key. Patterns recorded with this same `:tree-id` (via `ontology/record-tree-strength` / `ontology/record-tree-weakness`) are loaded for injection. Use a *stable* UUID per task class so unrelated runs share the same pattern store. |
+| `:self-learning?` | bool | Enables the retrieval path. Without it set to `true`, no ontology lookup happens. |
+| `:include-patterns` | bool | When `true`, recorded `:strengths` (success patterns) appear under "Learned Rules from Success Patterns". |
+| `:include-failures` | bool | When `true`, recorded `:weaknesses` (failure patterns) appear under "Patterns to Avoid". |
+| `:problem-type` | string | Optional URI naming the problem class (e.g. `"problem:Classification"`, `"problem:Extraction"`). Used by the ontology's hybrid retrieval to widen matches via the problem-domain graph. |
+
+### Recording patterns
+
+Patterns are written via the standard ontology commands. A strength (success pattern) command:
+
+```clojure
+(require '[ai.obney.grain.command-processor-v2.interface :as cp])
+
+(cp/process-command
+  (assoc ctx :command
+    {:command/name :ontology/record-tree-strength
+     :tree-id <same-uuid-the-node-uses>
+     :pattern-uri "success:BoundedMapEachOnChunkedExtraction"
+     :confidence 1.0
+     :evidence-trace-ids [<tick-id>]
+     :avg-score 0.95
+     :domain-type "rlm-tree-design"
+     :context-conditions {:task-class :chunked-extraction
+                          :input-shape :large-document
+                          :symptom :rate-limit-risk-on-unbounded-parallelism}
+     :action-taken {:type "BoundedMapEach"
+                    :target "[:map-each {:from :chunks :as :chunk :into :results :max-concurrency 3} [:llm {...}]]"
+                    :reason "Sub-LLM rate limits exhaust on unbounded concurrency"}
+     :expected-outcome "Successful per-chunk extraction without rate-limit failures"}))
+```
+
+A weakness uses `:ontology/record-tree-weakness` with `:failure-uri`, `:severity`, `:triggers`, `:failure-context`, `:attempted-action`. See the SELF-LEARNING-MANUAL for the full command schemas.
+
+The structured fields map directly to the rendered output: `:context-conditions` becomes the "when" guard, `:action-taken.target` becomes the recommended pattern snippet (rendered as a Clojure code block), `:action-taken.reason` becomes the "Why" line, and `:expected-outcome` becomes the "Expected outcome" line.
+
+### What the model sees
+
+For a `:tree-id` with one recorded strength, the model's instruction is prepended with a "Relevant Knowledge" block:
+
+```
+## Relevant Knowledge
+
+### Learned Rules from Success Patterns
+- **BoundedMapEach** — when task-class=:chunked-extraction, input-shape=:large-document, symptom=:rate-limit-risk-on-unbounded-parallelism (95% confidence, 1 episode)
+  - Action:
+    ```clojure
+    [:map-each {:from :chunks :as :chunk :into :results :max-concurrency 3} [:llm {...}]]
+    ```
+  - Why: Sub-LLM rate limits exhaust on unbounded concurrency
+  - Expected outcome: Successful per-chunk extraction without rate-limit failures
+```
+
+The model receives this *before* it begins designing its tree, so its first `emit-tree!` response can take the recorded patterns into account. When multiple patterns are recorded, all are rendered (deduplicated and ordered by confidence) up to the `:max-items` default of 5.
+
+When the configured `:tree-id` has no recorded patterns (or `:self-learning?` is not set, or `:context` is absent entirely), no "Relevant Knowledge" section is injected — the researcher behaves identically to a node without `:context`.
+
+### When to use it
+
+- **Stable task classes** — pick a UUID per task class (e.g. document extraction, contract comparison) and tag all relevant principles with that UUID.
+- **High-confidence patterns only** — the same channel surfaces every recorded principle. If you want curated patterns instead of everything ever recorded, write a custom retrieval layer; the default loads all `:strengths`/`:weaknesses` for the configured `:tree-id`.
+- **Failures matter as much as successes** — `:include-failures true` is on by default in the examples for a reason. A "Patterns to Avoid" entry can be a stronger steering signal than a strength.
+
 ## Recursive mode (`:rlm {:recursive? true}`)
 
 When the `:recursive?` flag is set, `emit-tree!` is no longer terminal:
@@ -240,12 +507,24 @@ Each entry in `:tree-results` (visible via `(get-var :tree-results)`):
  :status :success | :partial | :failure | :timeout
  :elapsed-ms 4523
  :outputs-keys [:summary :chunk-summaries]     ; what's now in sandbox-vars
+ :outputs-previews {:summary "first ~500 chars…"
+                    :chunk-summaries {:count 22 :sample-3 [...]}}
  :nodes-succeeded 22
  :nodes-failed 2
  :nodes-total 24
  :usage {:prompt-tokens N :completion-tokens N :total-tokens N}
 
- ;; ONLY when :status is :partial or :failure
+ ;; ONLY when declared writes came back nil/empty even on :status :success —
+ ;; soft signal that the tree finished but a downstream aggregator produced
+ ;; nothing useful for that key.
+ :nil-writes [:obligations :penalties]
+
+ ;; ONLY when direct (non-map-each) leaves failed — each entry identifies
+ ;; the failing leaf so the model can target a recovery without
+ ;; rebuilding the whole tree.
+ :failed-leaves [{:node-id <uuid> :status :failure :error "Duplicate key: null"}]
+
+ ;; ONLY when :status is :partial or :failure for map-each children
  ;; (verbatim from the underlying map-each's :partial-summary):
  :failure-indices [7 17]
  :failure-reasons {7 "Rate limit exhausted" 17 "Schema validation failed"}
@@ -257,6 +536,13 @@ Each entry in `:tree-results` (visible via `(get-var :tree-results)`):
 ```
 
 The summary is **descriptive, not prescriptive** — raw enums, factual counts, verbatim error strings. The model interprets for its own task. No `:severity :high`, no `:recommended-action`. The executor doesn't editorialize.
+
+The `:failed-leaves` field is the per-leaf attribution for non-map-each
+failures: when a `:code` leaf throws or an `:llm` leaf fails schema
+validation, the entry carries the node-id and the verbatim error
+message. The model uses this to localize the failure within `:tree-raw`
+and typically emits a focused single-node recovery tree that reads the
+surviving sandbox-vars rather than redesigning the pipeline.
 
 ### Drill-down primitives (when the summary isn't enough)
 
@@ -273,6 +559,42 @@ In recursive mode the SCI sandbox also exposes five primitives that read directl
 Usage guidance baked into the system prompt: **prefer the `:tree-results` summary; drill down only when the summary doesn't give you enough to decide your next step.** A `(tree-trajectory)` call can return multi-KB data — pulling it into every iteration's history bloats the next prompt.
 
 These primitives are bound in the sandbox **only when `:recursive? true`** — non-recursive callers (`:rlm true`, `:rlm {:debug? true}`) get unresolved-symbol if they try to call them.
+
+### Common pitfalls (forward guidance baked into the prompt)
+
+The Phase-1 instructions block includes a "Common pitfalls" section that
+warns the model about recurring SCI/Clojure footguns and pairs each with
+a concrete workaround. The full list (paraphrased):
+
+- **Set literals with computed elements fail SCI's reader.**
+  `#{(get-in m k1) (get-in m k2)}` — use `(set [(expr1) (expr2)])` for sets
+  built from runtime values.
+- **`frequencies` over collections that may contain `nil`** produces a
+  `{nil N}` entry that collides downstream — filter first:
+  `(frequencies (filter some? coll))`.
+- **`(get-var :foo)` returns `nil` after a Phase-2 `:failure`** — always
+  guard: `(when-let [v (get-var :foo)] ...)`. The writes were intent;
+  not all of them landed.
+- **Namespaced symbols don't resolve in the SCI sandbox** —
+  `clojure.string/join` etc. won't load. Use bound primitives (`str`,
+  `apply`, `interpose`, `reduce`, `map`, `filter`, `into`, `vec`) or
+  re-derive locally with `let`.
+- **`:output-schemas` must match the downstream consumer's shape** —
+  Malli structure: `[:map [:a :string] [:b :int]]`, NOT
+  `[:map :a :string :b :int]`.
+- **Inline-fn unbound-name captures fail at execution, not at emit** —
+  every name in the `:fn` body must be destructured from `(:keys [inputs])`,
+  bound in a `let`, or a sandbox primitive.
+- **`(get-in m [...])` on `nil` returns `nil` silently** — verify the top
+  of the data is non-nil before deep `get-in`.
+- **For-comprehensions return lazy seqs** — `(mapv ...)` or
+  `(doall ...)` when you need eager evaluation or predictable error
+  attribution.
+
+This section appears in every Phase-1 prompt, before the model designs
+its tree. It's intended to prevent first-iteration failures rather than
+serve as backward retry signal (R-6's line+caret context handles the
+backward path).
 
 ### Example: two-step task
 
@@ -320,6 +642,9 @@ When the model's Phase 1 code executes in the SCI sandbox, the following primiti
 | `(get-input :key)` | Read a declared input |
 | `(final! {...})` | **Terminate** with validated output |
 | `(emit-tree! [...])` | Emit a behavior tree for Phase 2 execution |
+| `(mint-behavior! "name" body)` / `(mint-behavior! "name" body :parent parent-id)` | Contribute a new behavioral subtree to the corpus. Returns the minted behavior's UUID-string. The minted body must validate against the description-body Malli schema (capabilities + principle-shaped strengths/weaknesses + representative-uses + summary). Persists for future `classify-behaviors` calls across all consumers — see [`SELF-IMPROVING-LOOP.md`](SELF-IMPROVING-LOOP.md#new-patterns-get-minted-when-the-model-encounters-genuinely-new-work). |
+
+The drill-down primitives `(tree-detail)`, `(tree-trajectory)`, `(tree-failures)`, `(node-output node-id)`, `(node-input-profile node-id)` are also bound in the sandbox when `:recursive? true` — see [Drill-down primitives](#drill-down-primitives-when-the-summary-isnt-enough).
 
 All primitives execute IMMEDIATELY and return results to sandbox-vars. The model can compose them freely, reason about results across iterations (the history is rebuilt into each subsequent prompt), and decide its next move.
 
@@ -454,6 +779,19 @@ Per the Grain methodology — every event is monitorable.
 
 Judges in future work can subscribe to any of these for granular signal.
 
+### Live streaming (ephemeral)
+
+In addition to the durable events above, a live subscription
+(`orc/subscribe-execution` / `orc/execute-stream`, see
+[`docs/STREAMING.md`](STREAMING.md)) receives **ephemeral** RLM events that
+are never persisted: `:rlm-iteration-started`, `:rlm-code-generated`
+(capped), `:rlm-sandbox-completed` per Phase 1 iteration, and
+`:rlm-phase2-started` / `:rlm-phase2-completed` around each Phase 2 child
+tick. Phase 2 child ticks carry `:parent-tick-id` lineage on their
+`:sheet/tree-tick-started` events, and the subscription automatically
+covers the whole child-tick cascade. `orc/cancel!` cancels a tick plus its
+known children (best-effort; in-flight LLM calls complete).
+
 ## Result shape
 
 When you call `orc/execute`, the result delivered to your caller has:
@@ -503,9 +841,75 @@ When `:recursive? true` is set, the sandbox also exposes the drill-down primitiv
 
 The DSL the model writes inside `(emit-tree! [...])` supports `:sequence`, `:parallel`, `:fallback`, `:map-each`, `:llm`, `:code`, `:chunk-document`, `:aggregate`, `:condition`, and `:final`. See [Phase 2 tree DSL node types](#phase-2-tree-dsl-node-types) above for the full shape of each.
 
+### Ontology context
+
+Opt in via `:context` on the node. The framework loads patterns recorded under the configured `:tree-id` and prepends a "Relevant Knowledge" block to the instruction. See [Ontology context injection](#ontology-context-injection-context) above for config, recording, and rendered output.
+
+## Judges on repl-researcher nodes (RLM-specific defaults + Living Description loop)
+
+The general judge system — declaring judges, attaching them to leaf or repl-researcher nodes, building custom judges with `:code` or `:llm` workflows — is covered in [`ORC-SERVICE-GUIDE.md` § Attaching Judges to Nodes](ORC-SERVICE-GUIDE.md#attaching-judges-to-nodes). The rest of this section is what's RLM-specific.
+
+### 5 default judges auto-attach to `:repl-researcher`
+
+When the Living Description opt-in flag is on, every `:repl-researcher` node that DOESN'T have an explicit `:judges` field set gets these 5 default judges automatically:
+
+| Judge | What it grades | Implementation |
+|---|---|---|
+| `heuristic-structural` | The shape of the tree the model emitted in Phase 1 | Pure heuristic over `:generated-tree-raw` |
+| `grounding` | Are the output claims supported by the original inputs? | LLM with structured-output rubric |
+| `reasoning` | Logical consistency of the model's chain of thought | LLM rubric |
+| `completeness` | Does the output cover what the instruction asked? | LLM rubric |
+| `instruction-following` | Did the model follow the explicit task requirements? | LLM rubric |
+
+Consumers can override defaults by explicitly calling `:sheet/set-node-judges` on a repl-researcher node — then ONLY their list applies. To turn the loop on:
+
+```clojure
+(cp/process-command
+  (assoc ctx :command
+         {:command/name :ontology/set-living-description-enabled
+          :command/id (random-uuid)
+          :command/timestamp (time/now)
+          :enabled? true}))
+```
+
+After that, every repl-researcher terminal `:sheet/node-execution-completed` event produces 5 `:judge/score-emitted` events (plus 1 per intermediate `:rlm/tree-generated` for `heuristic-structural`, which has its own processor for per-Phase-1-iteration grading).
+
+### The data flow back to the model's next run
+
+This is what makes judge signal RLM-specific (vs. retrospective batch evaluation). Judge scores feed the consolidator → consolidator updates the tree-class description body → R-Inject's prepend on the NEXT run reads the updated body:
+
+```
+host repl-researcher fires :sheet/node-execution-completed (terminal) +
+                            :rlm/tree-generated (per emit-tree iter)
+   ↓
+per-event evaluator processors (judge_runtime)
+   ↓ (for each attached judge, in parallel via futures)
+   - default LLM judges → invoke-llm-judge → dscloj/predict
+   - heuristic-structural → pure heuristic over generated-tree-raw
+   - :custom → orc/execute on consumer's eval sheet
+   ↓
+:judge/score-emitted events land
+   ↓
+consolidator's gather-recent-tree-class-events joins judges to observations
+   ↓
+:aggregate-metrics :judge-averages → consolidator's LLM reflection input
+   ↓
+:tree-description-updated body integrates judge-grounded principles
+   (e.g. "vulnerability to zero-score grounding when input context is missing")
+   ↓
+R-Inject's prepend on the NEXT run reads the updated body
+   ↓
+model designs a tree informed by what judges saw last time
+```
+
+A consumer who attaches a hallucination-risk LLM judge to their repl-researcher (via the general attach flow in `ORC-SERVICE-GUIDE.md`) will see the consolidator's body integrate "vulnerability to hallucinations when ..." weaknesses across cycles, feeding back into the model's tree design via R-Inject. This is the foundation for prebuilt-tree structural evolution via judge feedback — a stronger primitive than GEPA-on-prompts alone because the judge signal is per-execution and structured.
+
+The same mechanism applies to custom judges attached to repl-researcher nodes: their scores flow into `:judge-averages` and the consolidator's reflection input identically to defaults.
+
 ## Related guides
 
 - [`docs/ORC-SERVICE-GUIDE.md`](ORC-SERVICE-GUIDE.md) — Core execution engine and DSL reference
 - [`docs/dsl-tutorial.md`](dsl-tutorial.md) — Step-by-step DSL tutorial
 - [`docs/EVENT-STORE-PATTERNS.md`](EVENT-STORE-PATTERNS.md) — Grain event-sourcing patterns
+- [`docs/LIVING-DESCRIPTIONS.md`](LIVING-DESCRIPTIONS.md) — How judge scores feed the description-update loop
 - [`development/bench/RESULTS.md`](../development/bench/RESULTS.md) — Generalization benchmark headline report

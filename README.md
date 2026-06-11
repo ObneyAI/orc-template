@@ -188,24 +188,25 @@ Postgres for production (RLS, per-tenant advisory locks, Fressian serialization)
 ## deps.edn — pinned versions & packages
 
 grain and orc are **git deps pinned to a SHA**. To update grain/orc later, bump
-these two SHAs (and refresh the snapshots in `docs/orc-reference/`):
+these two SHAs to their remote HEADs (and refresh the snapshots in
+`docs/orc-reference/`):
 
 | | Pinned SHA |
 |---|---|
-| **grain** | `d34b4496d00d70a0ff5d8539b5d0b40ad73a4541` |
-| **orc**   | `83c315ad53449cb3e8ceba6a8b824291cf4378ae` |
+| **grain** | `0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856` |
+| **orc**   | `ebb9a48d38a2264292bcf47dc3e953acd926a859` |
 
 ### Critical — a base orc app
 
 ```clojure
 {:deps {obneyai/grain-core-v2
         {:git/url "https://github.com/ObneyAI/grain.git"
-         :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+         :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
          :deps/root "projects/grain-core-v2"}
 
         obneyai/orc
         {:git/url "https://github.com/ObneyAI/orc.git"
-         :git/sha "83c315ad53449cb3e8ceba6a8b824291cf4378ae"
+         :git/sha "ebb9a48d38a2264292bcf47dc3e953acd926a859"
          :deps/root "projects/orc"}
 
         integrant/integrant {:mvn/version "1.0.1"}}
@@ -229,13 +230,13 @@ block and require its interface namespace (so the `:conn` type registers):
 ;; SQLite — local, single-node, file-backed
 obneyai/grain-event-store-sqlite-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-event-store-sqlite-v3"}
 
 ;; Postgres — production (RLS, per-tenant advisory locks, Fressian)
 obneyai/grain-event-store-postgres-v3
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-event-store-postgres-v3"}
 ```
 
@@ -248,25 +249,25 @@ The matching `:conn` maps and requires are in
 ;; Reactive server-rendered UI over SSE (Datastar)
 obneyai/grain-datastar-v2
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-datastar-v2"}
 
 ;; Distributed coordination — coordinator election, tenant leases, routing
 obneyai/grain-control-plane
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-control-plane"}
 
 ;; Exposes the live grain runtime/registries to AI coding agents over nREPL
 obneyai/grain-code-agent-tools
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-code-agent-tools"}
 
 ;; AWS CloudWatch metrics & dashboards
 obneyai/grain-mulog-aws-cloudwatch-emf-publisher
 {:git/url "https://github.com/ObneyAI/grain.git"
- :sha "d34b4496d00d70a0ff5d8539b5d0b40ad73a4541"
+ :git/sha "0ab49d7fd3847ce5ec485d29a6fbe292ba4e7856"
  :deps/root "projects/grain-mulog-aws-cloudwatch-emf-publisher"}
 ```
 
@@ -287,7 +288,7 @@ consumer deps for those — adding `obneyai/orc` gives you all of them.
 > ```clojure
 > obneyai/orc-service
 > {:git/url "https://github.com/ObneyAI/orc.git"
->  :git/sha "83c315ad53449cb3e8ceba6a8b824291cf4378ae"
+>  :git/sha "ebb9a48d38a2264292bcf47dc3e953acd926a859"
 >  :deps/root "components/orc-service"}
 > ```
 > This keeps the behaviour-tree engine, DSL, and repl-researcher. Component

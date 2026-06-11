@@ -3,7 +3,7 @@
 Verbatim copies of selected docs from the **orc** repo, pinned to the same SHA
 this project depends on:
 
-> orc `83c315ad53449cb3e8ceba6a8b824291cf4378ae`
+> orc `ebb9a48d38a2264292bcf47dc3e953acd926a859`
 > (`https://github.com/ObneyAI/orc`)
 
 Kept here so we have orc's own words at the exact version on our classpath, even
@@ -21,8 +21,8 @@ orc SHA in `deps.edn`.
 To refresh after bumping the SHA:
 ```bash
 GL=~/.gitlibs/libs/obneyai/orc/<new-sha>
-cp "$GL/README.md"                docs/orc-reference/orc-README.md
-cp "$GL/docs/RLM-GUIDE.md"        docs/orc-reference/RLM-GUIDE.md
+cp "$GL/README.md"                  docs/orc-reference/orc-README.md
+cp "$GL/docs/RLM-GUIDE.md"          docs/orc-reference/RLM-GUIDE.md
 cp "$GL/docs/pattern-compendium.md" docs/orc-reference/pattern-compendium.md
-cp "$GL/docs/ARCHITECTURE.md"     docs/orc-reference/ARCHITECTURE.md
+cp "$GL/docs/ARCHITECTURE.md"       docs/orc-reference/ARCHITECTURE.md
 ```
